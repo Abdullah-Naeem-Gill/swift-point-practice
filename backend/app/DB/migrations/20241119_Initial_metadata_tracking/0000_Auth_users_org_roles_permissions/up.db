@@ -1,0 +1,238 @@
+
+CREATE TABLE IF NOT EXISTS org(
+    uuid UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(100) NOT NULL UNIQUE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by VARCHAR(255),
+    updated_by VARCHAR(255)
+);
+
+
+CREATE TABLE IF NOT EXISTS roles(
+    uuid UUID PRIMARY KEY DEFAULT uuid_generate_v4,
+    role_name VARCHAR(50) NOT NULL UNIQUE
+);
+
+
+CREATE TABLE IF NOT EXISTS users (
+    uuid UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL, -- Important, email is unique, which means the same email cannot be used for multiple organizations
+    org_uuid UUID REFERENCES org(uuid),
+    role_uuid UUID NOT NULL REFERENCES roles(uuid),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by VARCHAR(255),
+    updated_by VARCHAR(255)
+);
+
+
+CREATE TABLE IF NOT EXISTS permissions (
+    uuid UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    role_uuid UUID NOT NULL REFERENCES roles(uuid),
+    table_name VARCHAR(100) NOT NULL,
+    permission VARCHAR(20) NOT NULL CHECK (permission IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE')),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by VARCHAR(255),
+    updated_by VARCHAR(255),
+    UNIQUE (role_uuid, table_name, permission) -- Prevent duplicate permission assignments for the same role and table
+);
+
+
+CREATE OR REPLACE FUNCTION get_current_user_org_uuid()
+RETURNS TABLE(user_uuid UUID, org_uuid UUID) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT u.uuid, u.org_uuid 
+    FROM users u 
+    WHERE u.email = current_setting('app.current_user');
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION check_user_permission(user_uuid UUID, input_table_name text, input_permission text)
+RETURNS BOOLEAN AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM permissions p
+        WHERE p.role_uuid = (SELECT role_uuid FROM users WHERE uuid = user_uuid)
+          AND p.table_name = input_table_name
+          AND p.permission = input_permission
+    ) THEN
+        RETURN FALSE;
+    END IF;
+
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION check_role_permission(input_role_uuid UUID, input_table_name TEXT, input_permission TEXT)
+RETURNS BOOLEAN AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM permissions rp
+        WHERE rp.role_uuid = input_role_uuid
+          AND rp.table_name = input_table_name
+          AND rp.permission = input_permission
+    ) THEN
+        RAISE EXCEPTION 'Temp user Role does not have % permission on table %', permission, table_name;
+    END IF;
+
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+ALTER TABLE org ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION is_super_admin() RETURNS boolean AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1
+        FROM users u
+        JOIN roles r ON u.role_uuid = r.uuid
+        WHERE u.email = current_setting('app.current_user')
+        AND r.role_name = 'super-admin'
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE FUNCTION is_admin() RETURNS boolean AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1
+        FROM users u
+        JOIN roles r ON u.role_uuid = r.uuid
+        WHERE u.email = current_setting('app.current_user')
+        AND r.role_name = 'admin'
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+
+CREATE OR REPLACE FUNCTION is_own_org(org_uuid_param uuid) RETURNS boolean AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1
+        FROM users u
+        WHERE u.org_uuid = org_uuid_param
+        AND u.email = current_setting('app.current_user')
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+
+CREATE POLICY super_admin_insert_org_policy
+ON public.org
+FOR INSERT
+WITH CHECK (is_super_admin());
+
+CREATE POLICY select_org_policy
+ON public.org
+FOR SELECT
+USING (
+    is_super_admin() OR is_own_org(uuid)
+);
+
+CREATE POLICY update_org_policy
+ON public.org
+FOR UPDATE
+USING (
+    is_super_admin() OR (is_own_org(uuid) AND is_admin())
+);
+
+CREATE POLICY super_admin_delete_org_policy
+ON public.org
+FOR DELETE
+USING (is_super_admin());
+
+
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION is_not_creating_super_admin(role_uuid_param uuid) RETURNS boolean AS $$
+BEGIN
+    RETURN NOT EXISTS (
+        SELECT 1
+        FROM roles r
+        WHERE r.uuid = role_uuid_param
+        AND r.role_name = 'super-admin'
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE POLICY user_insert_policy
+ON users
+FOR INSERT
+WITH CHECK (
+    (
+        is_super_admin() -- Super-admin can create any user
+    )
+    OR
+    (
+        is_admin() 
+        AND is_own_org(org_uuid) -- Ensure admin can only create users in their own organization
+        AND is_not_creating_super_admin(role_uuid) -- Admin cannot create super-admin users
+    )
+);
+
+
+CREATE POLICY user_select_policy
+ON users
+FOR SELECT
+USING (
+    TRUE 
+);
+
+CREATE POLICY user_update_policy
+ON users
+FOR UPDATE
+USING (
+    is_super_admin() 
+    OR (
+        is_admin() 
+        AND is_own_org(org_uuid) 
+    )
+);
+
+CREATE POLICY user_delete_policy
+ON users
+FOR DELETE
+USING (
+    is_super_admin()
+);
+
+
+CREATE OR REPLACE FUNCTION set_org_uuid_based_on_role()
+RETURNS TRIGGER AS $$
+DECLARE
+    creator_role_name VARCHAR(50);
+    creator_org_uuid UUID;
+BEGIN
+    SELECT r.role_name, u.org_uuid
+    INTO creator_role_name, creator_org_uuid
+    FROM users u
+    JOIN roles r ON u.role_uuid = r.uuid
+    WHERE u.email = current_setting('app.current_user');
+
+    IF EXISTS (
+        SELECT 1
+        FROM roles r
+        WHERE r.uuid = NEW.role_uuid
+        AND r.role_name = 'super-admin'
+    ) THEN
+        NEW.org_uuid = NULL;
+
+    ELSIF creator_role_name = 'admin' THEN
+        NEW.org_uuid = creator_org_uuid;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER set_org_uuid_based_on_role_trigger
+BEFORE INSERT ON users
+FOR EACH ROW
+EXECUTE FUNCTION set_org_uuid_based_on_role();
